@@ -1,8 +1,13 @@
 
 """
-A Affinity world module
+affinity module is aimed at managing multiple availability zone situations
+that need local read affinity.
+local read affinity in ceph means that all primary OSDs of a pool are from the same az.
 
 See doc/mgr/affinity.rst for more info.
+
+currently the only implemented feature is the ability to create such pool, by creating the correct CRUSH rule.
+in the futuer we will implement more features to monitor and manage failures, etc.
 """
 
 from mgr_module import MgrModule, CommandResult, HandleCommandResult
@@ -14,8 +19,8 @@ import subprocess
 from tempfile import mkstemp
 from mako.template import Template
 
+
 class Affinity(MgrModule):
-    # these are CLI commands we implement
     COMMANDS = [
         {
             "cmd": "affinity create pool "
@@ -29,23 +34,22 @@ class Affinity(MgrModule):
         },
     ]
 
-    # these are module options we understand.  These can be set with
-    # 'ceph config set global mgr/hello/<name> <value>'.  e.g.,
-    # 'ceph config set global mgr/hello/place Earth'
-    MODULE_OPTIONS = [
-    ]
-
     def __init__(self, *args, **kwargs):
         super(Affinity, self).__init__(*args, **kwargs)
-
-        #self.osdmap = self.get('osd_map')
-        #self.osdmap_dump = self.osdmap.dump()
-        #self.crush = self.osdmap.get_crush()
-        #self.crush_dump = self.crush.dump()
 
         # set up some members to enable the serve() method and shutdown
         self.run = True
         self.event = Event()
+
+    def get_highest_rule_id(self):
+        crush = self.get('osd_map_crush')
+        crush_rules = crush['rules']
+        id = 1
+        for rule in crush_rules:
+            if rule['rule_id'] > id:
+                id = rule['rule_id']
+
+        return id
 
     def create_crush_affined_rule(self, name, region, pd, sd, td):
         rule_template = Template(""" rule ${name} {
@@ -68,44 +72,51 @@ class Affinity(MgrModule):
 
         editable_crushmap_filename = crushmap_filename+".editable"
 
-        result = CommandResult('')
-        self.send_command(result, 'mon', '', json.dumps({
-            'prefix': 'osd getcrushmap'
-        }), '')
-        r, outb, outs = result.wait()
-        if r != 0:
-            self.log.error('Error dumping crush map')
-            return
+        #get binary crush map
+        ret, buf, errs = self.rados.mon_command(json.dumps({"prefix":"osd getcrushmap"}), b'')
+        if ret != 0:
+            raise RuntimeError("Error getting binary crushmap. ret {}: '{}'".format(
+                ret, err))
 
-        with open("/tmp/af.log","w") as f:
-            f.write(outb.__class__.__name__)
-
+        # write binary crush map to file for crushtool
         with open(crushmap_filename,"wb") as f:
-            f.write(bytearray(outb))
+            f.write(bytearray(buf))
 
-        #os.close(tempfd)
-        return
+        os.close(tempfd)
 
-        #crushmap_filename])
+        # decompile binary crush map
         subprocess.check_call(["crushtool","-d",crushmap_filename,"-o",editable_crushmap_filename])
+
+        # write new rule to editable crush map, using template
         with open(editable_crushmap_filename,"a") as cmfile:
             cmfile.write(rule_template.render(
                 name=name, 
-                rule_id=get_highest_rule_id()+1,
+                get_highest_rule_id()+1,
                 region=region,
-                primary_domain=pdomain,
-                secondary_domain=sdomain,
-                tertiary_domain=tdomain
+                primary_domain=pd,
+                secondary_domain=sd,
+                tertiary_domain=td
             ))
-        subprocess.check_call(["crushtool","-c",editable_crushmap_filename,"-o",crushmap_filename])
-        subprocess.call(["ceph","osd","setcrushmap","-i",crushmap_filename])
 
-#        os.remove(crushmap_filename)
-#        os.remove(editable_crushmap_filename)
+        # compile editable crush map
+        subprocess.check_call(["crushtool","-c",editable_crushmap_filename,"-o",crushmap_filename])
+
+        # read compiled, binary crush map
+        with open(crushmap_filename,"rb") as f:
+            barr = f.read()
+
+        # apply binary crush map
+        ret, buf, errs = self.rados.mon_command(json.dumps({"prefix":"osd setcrushmap"}), barr)
+        if ret != 0:
+            raise RuntimeError("Error setting binary crushmap. ret {}: '{}'".format(
+                ret, err))
+
+        # remove temporary files
+        os.remove(crushmap_filename)
+        os.remove(editable_crushmap_filename)
 
     def handle_command(self, inbuf, cmd):
         self.log.debug("Handling command: '%s'" % str(cmd))
-        self.log.error("uid is: " + str(os.getuid()))
         message=cmd['prefix']
         message += "uid: " 
         message += str(os.getuid())
@@ -120,18 +131,14 @@ class Affinity(MgrModule):
             self.log.debug("after create rule")
             
         status_code = 0
-        output_buffer = "Output buffer is for data results"
-        output_string = "Output string is for informative text"
+        output_buffer = ""
+        output_string = ""
 
         message=cmd['prefix']
         return HandleCommandResult(retval=status_code, stdout=output_buffer,
                                    stderr=message + "\n" + output_string)
 
     def serve(self):
-        """
-        This method is called by the mgr when the module starts and can be
-        used for any background activity.
-        """
         self.log.info("Starting")
         while self.run:
             sleep_interval = 5
@@ -140,10 +147,6 @@ class Affinity(MgrModule):
             self.event.clear()
 
     def shutdown(self):
-        """
-        This method is called by the mgr when the module needs to shut
-        down (i.e., when the serve() function needs to exit.
-        """
         self.log.info('Stopping')
         self.run = False
         self.event.set()
