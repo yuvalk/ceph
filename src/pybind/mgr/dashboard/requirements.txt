@@ -8,3 +8,4 @@ python3-saml
 requests
 Routes
 six
+urllib3>=2.5.0 # not directly required, pinned by Snyk to avoid a vulnerability
